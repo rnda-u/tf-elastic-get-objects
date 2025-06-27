@@ -1,12 +1,13 @@
 import json
 from datetime import datetime
-import argparse # Import the argparse module
+import argparse
+import re # Import the regular expression module
 
 # --- Configuration Parameters ---
 # Name of the JSON file containing the Elasticsearch index data
 FILE_NAME = './data.json'
-# Number of the latest indexes to retrieve for each index pattern
-NUM_LATEST_INDEXES = 5
+# Number of the latest indexes to retrieve for each index base name
+NUM_LATEST_INDEXES_PER_BASE_NAME = 2 # Renamed for clarity
 # Criteria for the status icon
 REQUIRED_INDEX_MODE = "logsdb"
 REQUIRED_HOST_NAME_FIELD_TYPE = "keyword"
@@ -34,6 +35,24 @@ def get_readable_date(timestamp_ms_str):
         creation_date_readable = "Invalid Date"
     return creation_date_readable
 
+def extract_index_base_name(index_name):
+    """
+    Extracts the base name of an Elasticsearch index by removing the
+    trailing date and sequence number (e.g., '-YYYY.MM.DD-NNNNNN').
+
+    Args:
+        index_name (str): The full index name.
+
+    Returns:
+        str: The extracted base name or the original name if pattern not found.
+    """
+    # Regex to match trailing -YYYY.MM.DD-NNNNNN (or -YYYY.MM.DD-NNNNNN.subname)
+    # This pattern should be robust enough for common ILM index naming conventions
+    match = re.search(r'-\d{4}\.\d{2}\.\d{2}-\d{6}(?:-\d+)?$', index_name)
+    if match:
+        return index_name[:match.start()]
+    return index_name # Return original if no date/sequence pattern found
+
 def load_data_from_json(file_path):
     """
     Loads JSON data from a specified file path.
@@ -59,46 +78,74 @@ def load_data_from_json(file_path):
         print(f"Error: The file '{file_path}' is not a valid JSON.")
         raise
 
-def get_latest_indexes_per_pattern(elastic_indices_data, num_indexes):
+def get_latest_indexes_by_base_name(elastic_indices_data, num_latest):
     """
-    Processes Elasticsearch index data to get the latest 'num_indexes'
-    created for each index pattern, sorted by creation date.
+    Processes Elasticsearch index data to first group by 'base name'
+    (extracted from index_name) and then select the 'num_latest' created
+    for each base name, sorted by creation date.
+    Each selected index dictionary is augmented with its 'original_index_pattern'.
 
     Args:
         elastic_indices_data (list): The 'value' list from Elasticsearch_indices.
-        num_indexes (int): The number of latest indexes to retrieve.
+        num_latest (int): The number of latest indexes to retrieve per base name.
 
     Returns:
-        dict: A dictionary where keys are index patterns and values are lists
-              of the latest 'num_indexes' index dictionaries.
+        dict: A dictionary where keys are index base names and values are lists
+              of the latest 'num_latest' index dictionaries, each including
+              the 'original_index_pattern'.
     """
-    processed_data = {}
-    for item in elastic_indices_data:
-        index_pattern = item.get("index_pattern")
-        indexes = item.get("indexes", [])
+    indexes_by_base_name = {}
 
-        if not index_pattern: # Skip if index_pattern is missing
+    for item in elastic_indices_data:
+        current_index_pattern = item.get("index_pattern") # Get the index pattern here
+        indexes_list_from_pattern = item.get("indexes", [])
+
+        if not current_index_pattern:
             continue
 
-        # Sort indexes by index_creation_date in descending order
-        # Filter out indexes with invalid creation dates for sorting
-        valid_indexes = [idx for idx in indexes if idx.get("index_creation_date") is not None and str(idx["index_creation_date"]).isdigit()]
+        for index in indexes_list_from_pattern:
+            index_name = index.get("index_name")
+            creation_date_str = index.get("index_creation_date")
+
+            if not index_name or not creation_date_str:
+                # Skip invalid index entries
+                continue
+
+            base_name = extract_index_base_name(index_name)
+            
+            # Ensure creation_date is valid for sorting
+            if not str(creation_date_str).isdigit():
+                continue # Skip if creation date is not a valid number
+
+            # Make a copy of the index dictionary and add the original index_pattern
+            index_copy = index.copy()
+            index_copy['original_index_pattern'] = current_index_pattern 
+
+            if base_name not in indexes_by_base_name:
+                indexes_by_base_name[base_name] = []
+            
+            indexes_by_base_name[base_name].append(index_copy) # Append the modified copy
+
+    final_selection = {}
+    for base_name, indexes in indexes_by_base_name.items():
+        # Sort each group by index_creation_date in descending order
         sorted_indexes = sorted(
-            valid_indexes, key=lambda x: int(x["index_creation_date"]), reverse=True
+            indexes, key=lambda x: int(x["index_creation_date"]), reverse=True
         )
+        # Get the 'num_latest' entries for this base name
+        final_selection[base_name] = sorted_indexes[:num_latest]
 
-        # Get the 'num_indexes' latest entries
-        processed_data[index_pattern] = sorted_indexes[:num_indexes]
-    return processed_data
+    return final_selection
 
-def analyze_index_details(processed_indexes_by_pattern, required_mode, required_host_type,
+def analyze_index_details(processed_indexes_by_base_name, required_mode, required_host_type,
                           all_match_icon, partial_match_icon, no_match_icon):
     """
     Analyzes index details to determine a status icon based on index_mode
-    and host_name_fieldsType.
+    and host_name_fieldsType. Groups results by the original index pattern.
 
     Args:
-        processed_indexes_by_pattern (dict): Dictionary of processed indexes per pattern.
+        processed_indexes_by_base_name (dict): Dictionary of processed indexes per base name,
+                                                each index including 'original_index_pattern'.
         required_mode (str): The required value for 'index_mode' for a full match.
         required_host_type (str): The required value for 'host_name_fieldsType' for a full match.
         all_match_icon (str): Icon for when both conditions are met.
@@ -106,13 +153,17 @@ def analyze_index_details(processed_indexes_by_pattern, required_mode, required_
         no_match_icon (str): Icon for when neither condition is met.
 
     Returns:
-        dict: A dictionary with index patterns as keys and lists of analyzed
+        dict: A dictionary with original index patterns as keys and lists of analyzed
               index details (including status) as values.
     """
-    grouped_index_details = {}
-    for index_pattern, indexes in processed_indexes_by_pattern.items():
-        grouped_index_details[index_pattern] = []
-        for index in indexes:
+    # The output will now be grouped by original_index_pattern
+    grouped_details_by_original_pattern = {} 
+
+    for base_name, indexes_list_for_base_name in processed_indexes_by_base_name.items():
+        for index in indexes_list_for_base_name:
+            # Retrieve the original index_pattern from the augmented index dictionary
+            original_index_pattern = index.get('original_index_pattern', 'Unknown_Pattern') 
+            
             index_name = index.get("index_name", "N/A")
             index_mode = index.get("index_mode", "N/A")
             host_name_fieldsType = index.get("host_name_fieldsType", "N/A")
@@ -128,7 +179,11 @@ def analyze_index_details(processed_indexes_by_pattern, required_mode, required_
             else:
                 status_icon = no_match_icon
 
-            grouped_index_details[index_pattern].append(
+            # Append to the list corresponding to the original_index_pattern
+            if original_index_pattern not in grouped_details_by_original_pattern:
+                grouped_details_by_original_pattern[original_index_pattern] = []
+            
+            grouped_details_by_original_pattern[original_index_pattern].append(
                 {
                     "index_name": index_name,
                     "index_mode": index_mode,
@@ -136,24 +191,32 @@ def analyze_index_details(processed_indexes_by_pattern, required_mode, required_
                     "status": status_icon,
                 }
             )
-    return grouped_index_details
+    return grouped_details_by_original_pattern
 
-def print_raw_latest_indexes(processed_data_input):
-    """Prints a summary of the latest indexes per pattern with raw & readable creation dates."""
-    print("--- Latest Indexes per Index Pattern (Raw & Readable Creation Date) ---")
-    for pattern, indexes in processed_data_input.items():
-        print(f"\n Index Pattern: {pattern}")
+def print_raw_latest_indexes_by_base_name(processed_data_input):
+    """Prints a summary of the latest indexes per base name with raw & readable creation dates."""
+    print(f"--- Latest {NUM_LATEST_INDEXES_PER_BASE_NAME} Indexes per Index Base Name (Raw & Readable Creation Date) ---")
+    
+    if not processed_data_input:
+        print("   (No base names with indexes found.)")
+        return
+
+    for base_name, indexes in processed_data_input.items():
+        print(f"\n Base Name: {base_name}")
         if not indexes:
-            print("   (No latest indexes found for this pattern)")
+            print("   (No latest indexes found for this base name)")
             continue
         for idx in indexes:
             raw_date = idx.get('index_creation_date', 'N/A')
             readable_date = get_readable_date(raw_date)
-            print(f"   - Index Name: {idx.get('index_name', 'N/A')}, Creation  Date: {readable_date}")
+            # Accessing original_index_pattern if needed for this output, otherwise can omit
+            original_pattern = idx.get('original_index_pattern', 'N/A')
+            print(f"   - Index Name: {idx.get('index_name', 'N/A')}, Original Pattern: {original_pattern}, Creation Date: {readable_date}")
 
-def print_formatted_tables(grouped_details_input):
-    """Prints formatted tables of index details, separated by index pattern."""
-    print("\n--- Tables of Index Details with Status Icons (Separated by Index Pattern) ---")
+# Renamed the function for clarity
+def print_formatted_tables_by_pattern(grouped_details_input):
+    """Prints formatted tables of index details, separated by original index pattern."""
+    print("\n--- Tables of Index Details with Status Icons (Separated by Original Index Pattern) ---") # Adjusted title
 
     if not grouped_details_input:
         print("No indexes were processed or selected to display.")
@@ -161,7 +224,7 @@ def print_formatted_tables(grouped_details_input):
 
     # Define column widths for consistent formatting
     COL_WIDTHS = {
-        "Index Name": 70,
+        "Index Name": 90,
         "Index Mode": 15,
         "Host Name Fields Type": 25,
         "Status": 8
@@ -177,8 +240,9 @@ def print_formatted_tables(grouped_details_input):
     separator_length = len(header_line)
 
 
-    for pattern, details_list in grouped_details_input.items():
-        print(f"\n--- Index Pattern: {pattern} ---")
+    # Iterate by original index pattern now
+    for pattern, details_list in grouped_details_input.items(): # 'pattern' is now the original_index_pattern
+        print(f"\n--- Original Index Pattern: {pattern} ---") # Changed from Base Name to Original Index Pattern
         if details_list:
             # Print header for each sub-table
             print(header_line)
@@ -192,7 +256,7 @@ def print_formatted_tables(grouped_details_input):
                     f"{row['status']:<{COL_WIDTHS['Status']}}"
                 )
         else:
-            print(f"  No selected indexes for this pattern.")
+            print(f"  No selected indexes for this original index pattern.") # Changed text
 
 # --- Main Execution Flow ---
 if __name__ == "__main__":
@@ -205,7 +269,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--show-raw-dates',
         '-r',
-        action='store_true',  # This means the argument is a flag; it's True if present, False otherwise
+        action='store_true',
         help="Display the summary of latest indexes including raw and readable creation dates."
     )
 
@@ -216,17 +280,18 @@ if __name__ == "__main__":
         json_data = load_data_from_json(FILE_NAME)
         elastic_indices_value = json_data.get("Elasticsearch_indices", {}).get("value", [])
 
-        processed_indexes = get_latest_indexes_per_pattern(elastic_indices_value, NUM_LATEST_INDEXES)
+        # Step 1: Get latest indexes by base name, carrying original_index_pattern
+        processed_indexes_by_base_name = get_latest_indexes_by_base_name(elastic_indices_value, NUM_LATEST_INDEXES_PER_BASE_NAME)
         
-        # Conditionally execute print_raw_latest_indexes
+        # Conditionally execute print_raw_latest_indexes_by_base_name
         if args.show_raw_dates:
+            print_raw_latest_indexes_by_base_name(processed_indexes_by_base_name)
+        else:
             print("--- Skipping raw index creation date summary (use -r or --show-raw-dates to enable) ---")
-            print_raw_latest_indexes(processed_indexes)
 
-
-
-        analyzed_data = analyze_index_details(
-            processed_indexes,
+        # Step 2: Analyze details and group them by original_index_pattern for final tables
+        analyzed_data_grouped_by_pattern = analyze_index_details(
+            processed_indexes_by_base_name,
             REQUIRED_INDEX_MODE,
             REQUIRED_HOST_NAME_FIELD_TYPE,
             STATUS_ICON_ALL_MATCH,
@@ -234,12 +299,11 @@ if __name__ == "__main__":
             STATUS_ICON_NO_MATCH
         )
         
-        print_formatted_tables(analyzed_data)
+        # Step 3: Print the final formatted tables, now grouped by original_index_pattern
+        print_formatted_tables_by_pattern(analyzed_data_grouped_by_pattern)
 
     except (FileNotFoundError, json.JSONDecodeError) as e:
-        # Errors already handled and printed by the called functions, just exit.
-        # You can add more specific logging here if needed.
         exit(1)
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
-        exit(1)
+        exit(1) 

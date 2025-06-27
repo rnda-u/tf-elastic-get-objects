@@ -16,7 +16,7 @@ output "Elasticsearch_indices" {
                     index_ilm                = try(jsondecode(indice.settings_raw)["index.lifecycle.name"] , "N/A")
                     index_creation_date  = try(jsondecode(indice.settings_raw)["index.creation_date"] , "N/A")
 
-                    host_name_fieldsType =  try(jsondecode(indice.mappings).properties.host.properties.host.properties.build.type , "N/A")  
+                    host_name_fieldsType =  try(jsondecode(indice.mappings).properties.host.properties.name.type , "N/A")  
                 }
             ]
       }
